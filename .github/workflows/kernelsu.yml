@@ -3,7 +3,7 @@ name: KernelSU Development Build (Galaxy M30S)
 on:
   push:
     branches:
-      - aosp
+      - test
 
 jobs:
   notify:
