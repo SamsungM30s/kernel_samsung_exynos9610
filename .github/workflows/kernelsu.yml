@@ -44,8 +44,8 @@ jobs:
       matrix:
         variant: [oneui, aosp]
         enforcing: [e, p]
-        android: [11,12]
-        device: [m30s, a50]
+        android: [12]
+        device: [m30s]
 
       fail-fast: false
 
@@ -53,7 +53,7 @@ jobs:
       - uses: actions/checkout@v2
         with:
           fetch-depth: 0 
-          submodules: true
+          submodules: false
 
       - uses: szenius/set-timezone@v1.0
         with:
@@ -69,14 +69,6 @@ jobs:
       - name: Install Debian/Ubuntu dependencies
         run: sudo apt-get install bzip2 lib32stdc++6 libc6-dev-i386 libncurses5 jq -y
      
-      - name: Setup KernelSU
-        run: |
-          set -eo pipefail
-          echo "  I: Building Mint kernel ${GITHUB_REF##*/}-${GITHUB_RUN_NUMBER}"
-          cd KernelSU
-          echo "KSU_VERSION=$(($(git rev-list --count HEAD) + 10200))" >> $GITHUB_ENV
-          cd -
-
       - name: Build Mint kernel
         id: build-kernel
         run: |
