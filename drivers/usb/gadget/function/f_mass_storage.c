@@ -221,8 +221,6 @@
 #include <linux/usb/gadget.h>
 #include <linux/usb/composite.h>
 
-#include <linux/nospec.h>
-
 #include "configfs.h"
 
 #ifdef CONFIG_USB_ANDROID_SAMSUNG_COMPOSITE
@@ -232,7 +230,7 @@
 
 /*------------------------------------------------------------------------*/
 
-#define FSG_DRIVER_DESC		"mass_storage"
+#define FSG_DRIVER_DESC		"Mass Storage Function"
 #define FSG_DRIVER_VERSION	"2009/09/11"
 
 static const char fsg_string_interface[] = "Android Mass Storage";
@@ -661,21 +659,37 @@ static int start_transfer(struct fsg_dev *fsg, struct usb_ep *ep,
 
 static bool start_in_transfer(struct fsg_common *common, struct fsg_buffhd *bh)
 {
+	int rc;
+
 	if (!fsg_is_set(common))
 		return false;
 	bh->state = BUF_STATE_SENDING;
-	if (start_transfer(common->fsg, common->fsg->bulk_in, bh->inreq))
+	rc = start_transfer(common->fsg, common->fsg->bulk_in, bh->inreq);
+	if (rc) {
 		bh->state = BUF_STATE_EMPTY;
+		if (rc == -ESHUTDOWN) {
+			common->running = 0;
+			return false;
+		}
+	}
 	return true;
 }
 
 static bool start_out_transfer(struct fsg_common *common, struct fsg_buffhd *bh)
 {
+	int rc;
+
 	if (!fsg_is_set(common))
 		return false;
 	bh->state = BUF_STATE_RECEIVING;
-	if (start_transfer(common->fsg, common->fsg->bulk_out, bh->outreq))
+	rc = start_transfer(common->fsg, common->fsg->bulk_out, bh->outreq);
+	if (rc) {
 		bh->state = BUF_STATE_FULL;
+		if (rc == -ESHUTDOWN) {
+			common->running = 0;
+			return false;
+		}
+	}
 	return true;
 }
 
@@ -1273,7 +1287,7 @@ static void invalidate_sub(struct fsg_lun *curlun)
 {
 	struct file	*filp = curlun->filp;
 	struct inode	*inode = file_inode(filp);
-	unsigned long	rc;
+	unsigned long __maybe_unused	rc;
 
 	rc = invalidate_mapping_pages(inode->i_mapping, 0, -1);
 	VLDBG(curlun, "invalidate_mapping_pages -> %ld\n", rc);
@@ -3599,7 +3613,6 @@ static struct config_group *fsg_lun_make(struct config_group *group,
 	fsg_opts = to_fsg_opts(&group->cg_item);
 	if (num >= FSG_MAX_LUNS)
 		return ERR_PTR(-ERANGE);
-	num = array_index_nospec(num, FSG_MAX_LUNS);
 
 	mutex_lock(&fsg_opts->lock);
 	if (fsg_opts->refcnt || fsg_opts->common->luns[num]) {

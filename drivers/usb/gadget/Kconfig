@@ -134,6 +134,13 @@ config U_SERIAL_CONSOLE
 	help
 	   It supports the serial gadget can be used as a console.
 
+config USB_OLD_CONFIGFS
+	bool "Old style configfs"
+	depends on USB_CONFIGFS
+	default n
+	help
+	  It supports old style configfs
+
 config USB_G_ANDROID
 	bool "Android Composite Gadget"
 	help
@@ -480,10 +487,9 @@ config USB_CONFIGFS_F_CONN_GADGET
           SideSync
 
 config USB_F_CONN_GADGET_NDOP
-    bool "Conn gadget that do not support DexLive"
-    depends on USB_CONFIGFS_F_CONN_GADGET
-	depends on ANDROID_MAJOR_VERSION >= "q"
-    help
+        bool "Conn gadget that do not support DexLive"
+        depends on USB_CONFIGFS_F_CONN_GADGET
+        help
           Next SideSync
 
 config USB_CONFIGFS_F_SS_MON_GADGET
@@ -497,6 +503,7 @@ config USB_CONFIGFS_F_SS_MON_GADGET
 config USB_CONFIGFS_F_ACC
 	boolean "Accessory gadget"
 	depends on USB_CONFIGFS
+	depends on HID=y
 	select USB_F_ACC
 	help
 	  USB gadget Accessory support
@@ -639,34 +646,6 @@ config USB_CONFIGFS_F_TCM
 	  Both protocols can work on USB2.0 and USB3.0.
 	  UAS utilizes the USB 3.0 feature called streams support.
 
-choice
-	tristate "USB Gadget precomposed configurations"
-	default USB_ETH
-	optional
-	help
-	  A Linux "Gadget Driver" talks to the USB Peripheral Controller
-	  driver through the abstract "gadget" API.  Some other operating
-	  systems call these "client" drivers, of which "class drivers"
-	  are a subset (implementing a USB device class specification).
-	  A gadget driver implements one or more USB functions using
-	  the peripheral hardware.
-
-	  Gadget drivers are hardware-neutral, or "platform independent",
-	  except that they sometimes must understand quirks or limitations
-	  of the particular controllers they work with.  For example, when
-	  a controller doesn't support alternate configurations or provide
-	  enough of the right types of endpoints, the gadget driver might
-	  not be able work with that controller, or might need to implement
-	  a less common variant of a device class protocol.
-
-	  The available choices each represent a single precomposed USB
-	  gadget configuration. In the device model, each option contains
-	  both the device instantiation as a child for a USB gadget
-	  controller, and the relevant drivers for each function declared
-	  by the device.
-
 source "drivers/usb/gadget/legacy/Kconfig"
-
-endchoice
 
 endif # USB_GADGET
