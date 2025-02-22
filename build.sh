@@ -642,12 +642,6 @@ else
 	merge_config non-root
 fi
 
-# Use no-product Exynos DTB when building AOSP
-if [[ ${BUILD_KERNEL_CODE} == "aosp" ]]; then
-	script_echo "I: Copying no-product DTB file for use with AOSP ROMs."
-	cp -f $(pwd)/arch/arm64/boot/dts/exynos/aosp/exynos9610.dts $(pwd)/arch/arm64/boot/dts/exynos/
-fi
-
 set_android_version
 build_kernel
 
