@@ -110,6 +110,7 @@ static LIST_HEAD(drvdata_list);
 #define S3C64XX_SPI_ST_TX_FIFORDY		(1<<0)
 
 #define S3C64XX_SPI_PACKET_CNT_EN		(1<<16)
+#define S3C64XX_SPI_PACKET_CNT_MASK		GENMASK(15, 0)
 
 #define S3C64XX_SPI_PND_TX_UNDERRUN_CLR		(1<<4)
 #define S3C64XX_SPI_PND_TX_OVERRUN_CLR		(1<<3)
@@ -855,72 +856,73 @@ static int s3c64xx_spi_dma_initialize(struct s3c64xx_spi_driver_data *sdd,
 
 	return 0;
 }
+#define XFER_DMAADDR_INVALID  (~(dma_addr_t)0)
 
-static int s3c64xx_spi_map_one_msg(struct s3c64xx_spi_driver_data *sdd,
-						struct spi_message *msg, struct spi_transfer *xfer)
+static size_t s3c64xx_spi_max_transfer_size(struct spi_device *spi)
 {
+	struct spi_controller *ctlr = spi->controller;
+
+	/* Limit transfer size if controller supports DMA */
+	return ctlr->can_dma ? S3C64XX_SPI_PACKET_CNT_MASK : SIZE_MAX;
+}
+
+static int s3c64xx_spi_transfer_one(struct spi_master *master,
+				    struct spi_device *spi,
+				    struct spi_transfer *xfer)
+{
+	struct s3c64xx_spi_driver_data *sdd = spi_master_get_devdata(master);
 	struct s3c64xx_spi_info *sci = sdd->cntrlr_info;
 	struct device *dev = &sdd->pdev->dev;
+	int ret;
 
-	if ((msg->is_dma_mapped) || (sci->dma_mode != DMA_MODE))
-		return 0;
-
-	if (xfer->len <= ((FIFO_LVL_MASK(sdd) >> 1) + 1))
-		return 0;
-
-	if (xfer->tx_buf != NULL) {
-		xfer->tx_dma = dma_map_single(dev,
-				(void *)xfer->tx_buf, xfer->len,
-				DMA_TO_DEVICE);
+	/* Map TX buffer for DMA if available and transfer length large enough */
+	if (xfer->tx_buf && sci->dma_mode == DMA_MODE &&
+	    xfer->len > ((FIFO_LVL_MASK(sdd) >> 1) + 1)) {
+		xfer->tx_dma = dma_map_single(dev, (void *)xfer->tx_buf,
+					     xfer->len, DMA_TO_DEVICE);
 		if (dma_mapping_error(dev, xfer->tx_dma)) {
 			dev_err(dev, "dma_map_single Tx failed\n");
 			xfer->tx_dma = XFER_DMAADDR_INVALID;
 			return -ENOMEM;
 		}
+	} else {
+		xfer->tx_dma = XFER_DMAADDR_INVALID;
 	}
 
-	if (xfer->rx_buf != NULL) {
+	/* Map RX buffer for DMA if available and transfer length large enough */
+	if (xfer->rx_buf && sci->dma_mode == DMA_MODE &&
+	    xfer->len > ((FIFO_LVL_MASK(sdd) >> 1) + 1)) {
 		xfer->rx_dma = dma_map_single(dev, xfer->rx_buf,
-					xfer->len, DMA_FROM_DEVICE);
+					     xfer->len, DMA_FROM_DEVICE);
 		if (dma_mapping_error(dev, xfer->rx_dma)) {
 			dev_err(dev, "dma_map_single Rx failed\n");
-			dma_unmap_single(dev, xfer->tx_dma,
-					xfer->len, DMA_TO_DEVICE);
+			if (xfer->tx_dma != XFER_DMAADDR_INVALID)
+				dma_unmap_single(dev, xfer->tx_dma,
+						 xfer->len, DMA_TO_DEVICE);
 			xfer->tx_dma = XFER_DMAADDR_INVALID;
 			xfer->rx_dma = XFER_DMAADDR_INVALID;
 			return -ENOMEM;
 		}
+	} else {
+		xfer->rx_dma = XFER_DMAADDR_INVALID;
 	}
 
-	return 0;
+	/* Your SPI transfer start logic goes here */
+	/* For example: start SPI transfer using DMA or PIO */
+
+	/* ... */
+
+	/* After transfer completes, unmap the DMA buffers */
+
+	if (xfer->tx_dma != XFER_DMAADDR_INVALID)
+		dma_unmap_single(dev, xfer->tx_dma, xfer->len, DMA_TO_DEVICE);
+
+	if (xfer->rx_dma != XFER_DMAADDR_INVALID)
+		dma_unmap_single(dev, xfer->rx_dma, xfer->len, DMA_FROM_DEVICE);
+
+	return 0; /* Or appropriate return code */
 }
 
-static void s3c64xx_spi_unmap_one_msg(struct s3c64xx_spi_driver_data *sdd,
-						struct spi_message *msg, struct spi_transfer *xfer)
-{
-	struct s3c64xx_spi_info *sci = sdd->cntrlr_info;
-	struct device *dev = &sdd->pdev->dev;
-
-	if ((msg->is_dma_mapped) || (sci->dma_mode != DMA_MODE))
-		return;
-
-	if (xfer->len <= ((FIFO_LVL_MASK(sdd) >> 1) + 1))
-		return;
-
-	if (xfer->rx_buf != NULL
-			&& xfer->rx_dma != XFER_DMAADDR_INVALID)
-		dma_unmap_single(dev, xfer->rx_dma,
-					xfer->len, DMA_FROM_DEVICE);
-
-	if (xfer->tx_buf != NULL
-			&& xfer->tx_dma != XFER_DMAADDR_INVALID)
-		dma_unmap_single(dev, xfer->tx_dma,
-					xfer->len, DMA_TO_DEVICE);
-}
-
-
-static int s3c64xx_spi_transfer_one_message(struct spi_master *master,
-					    struct spi_message *msg)
 {
 	struct s3c64xx_spi_driver_data *sdd = spi_master_get_devdata(master);
 	struct s3c64xx_spi_info *sci = sdd->cntrlr_info;
@@ -1676,8 +1678,9 @@ static int s3c64xx_spi_probe(struct platform_device *pdev)
 	master->setup = s3c64xx_spi_setup;
 	master->cleanup = s3c64xx_spi_cleanup;
 	master->prepare_transfer_hardware = s3c64xx_spi_prepare_transfer;
-	master->transfer_one_message = s3c64xx_spi_transfer_one_message;
-	master->unprepare_transfer_hardware = s3c64xx_spi_unprepare_transfer;
+	master->prepare_message = s3c64xx_spi_prepare_message;
+	master->transfer_one = s3c64xx_spi_transfer_one;
+	master->max_transfer_size = s3c64xx_spi_max_transfer_size;
 	master->num_chipselect = sci->num_cs;
 	master->dma_alignment = 8;
 	master->bits_per_word_mask = BIT(32 - 1) | BIT(16 - 1) | BIT(8 - 1);

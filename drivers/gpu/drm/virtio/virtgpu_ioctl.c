@@ -97,93 +97,127 @@ static void virtio_gpu_unref_list(struct list_head *head)
  * VIRTIO_GPUReleaseInfo struct (first XXX bytes)
  */
 static int virtio_gpu_execbuffer_ioctl(struct drm_device *dev, void *data,
-				 struct drm_file *drm_file)
+                                       struct drm_file *drm_file)
 {
-	struct drm_virtgpu_execbuffer *exbuf = data;
-	struct virtio_gpu_device *vgdev = dev->dev_private;
-	struct virtio_gpu_fpriv *vfpriv = drm_file->driver_priv;
-	struct drm_gem_object *gobj;
-	struct virtio_gpu_fence *fence;
-	struct virtio_gpu_object *qobj;
-	int ret;
-	uint32_t *bo_handles = NULL;
-	void __user *user_bo_handles = NULL;
-	struct list_head validate_list;
-	struct ttm_validate_buffer *buflist = NULL;
-	int i;
-	struct ww_acquire_ctx ticket;
-	void *buf;
+    struct drm_virtgpu_execbuffer *exbuf = data;
+    struct virtio_gpu_device *vgdev = dev->dev_private;
+    struct virtio_gpu_fpriv *vfpriv = drm_file->driver_priv;
+    struct drm_gem_object *gobj;
+    struct virtio_gpu_fence *fence = NULL;
+    struct virtio_gpu_object *qobj;
+    struct sync_file *sync_file;
+    struct dma_fence *out_fence = NULL;
+    struct list_head validate_list;
+    struct ttm_validate_buffer *buflist = NULL;
+    uint32_t *bo_handles = NULL;
+    void __user *user_bo_handles = NULL;
+    struct ww_acquire_ctx ticket;
+    void *buf;
+    int out_fence_fd = -1;
+    int ret = 0, i;
 
-	if (vgdev->has_virgl_3d == false)
-		return -ENOSYS;
+    if (!vgdev->has_virgl_3d)
+        return -ENOSYS;
 
-	INIT_LIST_HEAD(&validate_list);
-	if (exbuf->num_bo_handles) {
+    INIT_LIST_HEAD(&validate_list);
 
-		bo_handles = kvmalloc_array(exbuf->num_bo_handles,
-					   sizeof(uint32_t), GFP_KERNEL);
-		buflist = kvmalloc_array(exbuf->num_bo_handles,
-					   sizeof(struct ttm_validate_buffer),
-					   GFP_KERNEL | __GFP_ZERO);
-		if (!bo_handles || !buflist) {
-			kvfree(bo_handles);
-			kvfree(buflist);
-			return -ENOMEM;
-		}
+    if (exbuf->num_bo_handles) {
+        bo_handles = kvmalloc_array(exbuf->num_bo_handles,
+                                    sizeof(uint32_t), GFP_KERNEL);
+        buflist = kvmalloc_array(exbuf->num_bo_handles,
+                                 sizeof(struct ttm_validate_buffer),
+                                 GFP_KERNEL | __GFP_ZERO);
+        if (!bo_handles || !buflist) {
+            ret = -ENOMEM;
+            goto out_free;
+        }
 
-		user_bo_handles = (void __user *)(uintptr_t)exbuf->bo_handles;
-		if (copy_from_user(bo_handles, user_bo_handles,
-				   exbuf->num_bo_handles * sizeof(uint32_t))) {
-			ret = -EFAULT;
-			kvfree(bo_handles);
-			kvfree(buflist);
-			return ret;
-		}
+        user_bo_handles = (void __user *)(uintptr_t)exbuf->bo_handles;
+        if (copy_from_user(bo_handles, user_bo_handles,
+                           exbuf->num_bo_handles * sizeof(uint32_t))) {
+            ret = -EFAULT;
+            goto out_free;
+        }
 
-		for (i = 0; i < exbuf->num_bo_handles; i++) {
-			gobj = drm_gem_object_lookup(drm_file, bo_handles[i]);
-			if (!gobj) {
-				kvfree(bo_handles);
-				kvfree(buflist);
-				return -ENOENT;
-			}
+        for (i = 0; i < exbuf->num_bo_handles; i++) {
+            gobj = drm_gem_object_lookup(drm_file, bo_handles[i]);
+            if (!gobj) {
+                ret = -ENOENT;
+                goto out_free;
+            }
 
-			qobj = gem_to_virtio_gpu_obj(gobj);
-			buflist[i].bo = &qobj->tbo;
+            qobj = gem_to_virtio_gpu_obj(gobj);
+            buflist[i].bo = &qobj->tbo;
+            list_add(&buflist[i].head, &validate_list);
+        }
+        kvfree(bo_handles);
+        bo_handles = NULL;
+    }
 
-			list_add(&buflist[i].head, &validate_list);
-		}
-		kvfree(bo_handles);
-	}
+    ret = virtio_gpu_object_list_validate(&ticket, &validate_list);
+    if (ret)
+        goto out_free;
 
-	ret = virtio_gpu_object_list_validate(&ticket, &validate_list);
-	if (ret)
-		goto out_free;
+    buf = kvmalloc(exbuf->size, GFP_USER);
+    if (!buf) {
+        ret = -ENOMEM;
+        goto out_unresv;
+    }
 
-	buf = memdup_user((void __user *)(uintptr_t)exbuf->command,
-			  exbuf->size);
-	if (IS_ERR(buf)) {
-		ret = PTR_ERR(buf);
-		goto out_unresv;
-	}
-	virtio_gpu_cmd_submit(vgdev, buf, exbuf->size,
-			      vfpriv->ctx_id, &fence);
+    if (copy_from_user(buf, u64_to_user_ptr(exbuf->command), exbuf->size)) {
+        ret = -EFAULT;
+        goto out_buf;
+    }
 
-	ttm_eu_fence_buffer_objects(&ticket, &validate_list, &fence->f);
+    fence = virtio_gpu_fence_alloc(vgdev);
+    if (!fence) {
+        ret = -ENOMEM;
+        goto out_buf;
+    }
+    out_fence = &fence->f;
 
-	/* fence the command bo */
-	virtio_gpu_unref_list(&validate_list);
-	kvfree(buflist);
-	dma_fence_put(&fence->f);
-	return 0;
+    if (exbuf->fence_fd >= 0) {
+        out_fence_fd = get_unused_fd_flags(O_CLOEXEC);
+        if (out_fence_fd < 0) {
+            ret = out_fence_fd;
+            goto out_fence;
+        }
 
+        sync_file = sync_file_create(out_fence);
+        if (!sync_file) {
+            put_unused_fd(out_fence_fd);
+            ret = -ENOMEM;
+            goto out_fence;
+        }
+
+        exbuf->fence_fd = out_fence_fd;
+        fd_install(out_fence_fd, sync_file->file);
+    }
+
+    virtio_gpu_cmd_submit(vgdev, buf, exbuf->size, vfpriv->ctx_id, fence);
+
+    ttm_eu_fence_buffer_objects(&ticket, &validate_list, out_fence);
+
+    virtio_gpu_unref_list(&validate_list);
+    kvfree(buflist);
+    dma_fence_put(out_fence);
+    kvfree(buf);
+    return 0;
+
+out_fence:
+    dma_fence_put(out_fence);
+out_buf:
+    kvfree(buf);
 out_unresv:
-	ttm_eu_backoff_reservation(&ticket, &validate_list);
+    ttm_eu_backoff_reservation(&ticket, &validate_list);
 out_free:
-	virtio_gpu_unref_list(&validate_list);
-	kvfree(buflist);
-	return ret;
+    virtio_gpu_unref_list(&validate_list);
+    kvfree(bo_handles);
+    kvfree(buflist);
+    return ret;
 }
+
+
 
 static int virtio_gpu_getparam_ioctl(struct drm_device *dev, void *data,
 				     struct drm_file *file_priv)

@@ -85,7 +85,9 @@ static inline struct f_ncm *func_to_ncm(struct usb_function *f)
 /* peak (theoretical) bulk transfer rate in bits-per-second */
 static inline unsigned ncm_bitrate(struct usb_gadget *g)
 {
-	if (gadget_is_superspeed(g) && g->speed >= USB_SPEED_SUPER_PLUS)
+	if (!g)
+		return 0;
+	else if (gadget_is_superspeed(g) && g->speed >= USB_SPEED_SUPER_PLUS)
 		return 4250000000U;
 	else if (gadget_is_superspeed(g) && g->speed == USB_SPEED_SUPER)
 		return 3750000000U;
@@ -1199,13 +1201,13 @@ static struct sk_buff *ncm_wrap_ntb(struct gether *port,
 #endif
 	return skb;
 }
-
 static int ncm_unwrap_ntb(struct gether *port,
 			  struct sk_buff *skb,
 			  struct sk_buff_head *list)
 {
 	struct f_ncm	*ncm = func_to_ncm(&port->func);
-	__le16		*tmp = (void *) skb->data;
+	unsigned char	*ntb_ptr = skb->data;
+	__le16		*tmp;
 	unsigned	index, index2;
 	unsigned	dg_len, dg_len2;
 	unsigned	ndp_len;
@@ -1214,41 +1216,51 @@ static int ncm_unwrap_ntb(struct gether *port,
 	unsigned	max_size = le32_to_cpu(ntb_parameters.dwNtbOutMaxSize);
 	const struct ndp_parser_opts *opts = ncm->parser_opts;
 	unsigned	crc_len = ncm->is_crc ? sizeof(uint32_t) : 0;
-	int		dgram_counter;
+	int		dgram_counter = 0;
+	int		to_process = skb->len;
+	unsigned	block_len;
+	unsigned	frame_max = 1514; /* typical max Ethernet frame size */
 
-	/* dwSignature */
+parse_ntb:
+	tmp = (__le16 *)ntb_ptr;
+
+	/* Check NTH signature */
 	if (get_unaligned_le32(tmp) != opts->nth_sign) {
 		INFO(port->func.config->cdev, "Wrong NTH SIGN, skblen %d\n",
-			skb->len);
+		     skb->len);
 		print_hex_dump(KERN_INFO, "HEAD:", DUMP_PREFIX_ADDRESS, 32, 1,
 			       skb->data, 32, false);
-
 		goto err;
 	}
 	tmp += 2;
-	/* wHeaderLength */
+
+	/* Check header length */
 	if (get_unaligned_le16(tmp++) != opts->nth_size) {
 		INFO(port->func.config->cdev, "Wrong NTB headersize\n");
 		goto err;
 	}
 	tmp++; /* skip wSequence */
 
-	/* (d)wBlockLength */
-	if (get_ncm(&tmp, opts->block_length) > max_size) {
+	/* Get block length */
+	block_len = get_ncm(&tmp, opts->block_length);
+	if (block_len > max_size) {
 		INFO(port->func.config->cdev, "OUT size exceeded\n");
 		goto err;
 	}
 
+	/* First NDP index */
 	index = get_ncm(&tmp, opts->fp_index);
-	/* NCM 3.2 */
+
+	/* Check index alignment per NCM 3.2 */
 	if (((index % 4) != 0) && (index < opts->nth_size)) {
-		INFO(port->func.config->cdev, "Bad index: %x\n",
-			index);
+		INFO(port->func.config->cdev, "Bad index: %x\n", index);
 		goto err;
 	}
 
-	/* walk through NDP */
-	tmp = ((void *)skb->data) + index;
+	/* Move tmp to NDP */
+	tmp = (__le16 *)(skb->data + index);
+
+	/* Check NDP signature */
 	if (get_unaligned_le32(tmp) != ncm->ndp_sign) {
 		INFO(port->func.config->cdev, "Wrong NDP SIGN\n");
 		goto err;
@@ -1256,80 +1268,91 @@ static int ncm_unwrap_ntb(struct gether *port,
 	tmp += 2;
 
 	ndp_len = get_unaligned_le16(tmp++);
-	/*
-	 * NCM 3.3.1
-	 * entry is 2 items
-	 * item size is 16/32 bits, opts->dgram_item_len * 2 bytes
-	 * minimal: struct usb_cdc_ncm_ndpX + normal entry + zero entry
-	 */
 	if ((ndp_len < opts->ndp_size + 2 * 2 * (opts->dgram_item_len * 2))
 	    || (ndp_len % opts->ndplen_align != 0)) {
 		INFO(port->func.config->cdev, "Bad NDP length: %x\n", ndp_len);
 		goto err;
 	}
+
 	tmp += opts->reserved1;
-	tmp += opts->next_fp_index; /* skip reserved (d)wNextFpIndex */
+	tmp += opts->next_fp_index;
 	tmp += opts->reserved2;
 
 	ndp_len -= opts->ndp_size;
+
+	/* Get first datagram index/length */
 	index2 = get_ncm(&tmp, opts->dgram_item_len);
 	dg_len2 = get_ncm(&tmp, opts->dgram_item_len);
-	dgram_counter = 0;
 
-	do {
+	/* Loop through datagram entries */
+	while (ndp_len > 0 && index2 != 0 && dg_len2 != 0) {
 		index = index2;
 		dg_len = dg_len2;
-		if (dg_len < 14 + crc_len) { /* ethernet header + crc */
-			INFO(port->func.config->cdev, "Bad dgram length: %x\n",
-			     dg_len);
+
+		/* Validate datagram length */
+		if (dg_len < 14 + crc_len || dg_len > frame_max) {
+			INFO(port->func.config->cdev, "Bad dgram length: %#X\n", dg_len);
 			goto err;
 		}
+
+		/* Validate index */
+		if (index < opts->nth_size || index > block_len - opts->dpe_size) {
+			INFO(port->func.config->cdev, "Bad index: %#X\n", index);
+			goto err;
+		}
+
+		/* CRC check */
 		if (ncm->is_crc) {
 			uint32_t crc, crc2;
 
-			crc = get_unaligned_le32(skb->data +
-						 index + dg_len - crc_len);
-			crc2 = ~crc32_le(~0,
-					 skb->data + index,
-					 dg_len - crc_len);
+			crc = get_unaligned_le32(ntb_ptr + index + dg_len - crc_len);
+			crc2 = ~crc32_le(~0, ntb_ptr + index, dg_len - crc_len);
 			if (crc != crc2) {
 				INFO(port->func.config->cdev, "Bad CRC\n");
 				goto err;
 			}
 		}
 
-		index2 = get_ncm(&tmp, opts->dgram_item_len);
-		dg_len2 = get_ncm(&tmp, opts->dgram_item_len);
+		/* Allocate skb for this datagram */
+		skb2 = netdev_alloc_skb_ip_align(ncm->netdev, dg_len - crc_len);
+		if (!skb2)
+			goto err;
 
-		if (index2 == 0 || dg_len2 == 0) {
-			skb2 = skb;
-		} else {
-			skb2 = skb_clone(skb, GFP_ATOMIC);
-			if (skb2 == NULL)
-				goto err;
-		}
+		/* Copy data to skb */
+		skb_put_data(skb2, ntb_ptr + index, dg_len - crc_len);
 
+		/* Adjust skb */
 		if (!skb_pull(skb2, index)) {
 			ret = -EOVERFLOW;
 			goto err;
 		}
-
 		skb_trim(skb2, dg_len - crc_len);
-		skb_queue_tail(list, skb2);
 
-		ndp_len -= 2 * (opts->dgram_item_len * 2);
+		/* Add skb to list */
+		skb_queue_tail(list, skb2);
 
 		dgram_counter++;
 
-		if (index2 == 0 || dg_len2 == 0)
-			break;
-	} while (ndp_len > 2 * (opts->dgram_item_len * 2)); /* zero entry */
+		ndp_len -= 2 * (opts->dgram_item_len * 2);
 
-	VDBG(port->func.config->cdev,
-	     "Parsed NTB with %d frames\n", dgram_counter);
+		/* Get next datagram index/length */
+		index2 = get_ncm(&tmp, opts->dgram_item_len);
+		dg_len2 = get_ncm(&tmp, opts->dgram_item_len);
+	}
+
+	VDBG(port->func.config->cdev, "Parsed NTB with %d frames\n", dgram_counter);
+
+	to_process -= block_len;
+	if (to_process > 0) {
+		ntb_ptr += block_len;
+		goto parse_ntb;
+	}
+
+	dev_consume_skb_any(skb);
 	return 0;
+
 err:
-	printk(KERN_DEBUG"usb:%s Dropped %d \n", __func__, skb->len);
+	printk(KERN_DEBUG "usb:%s Dropped %d\n", __func__, skb->len);
 	skb_queue_purge(list);
 	dev_kfree_skb_any(skb);
 	return ret;

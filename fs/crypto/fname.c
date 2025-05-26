@@ -256,6 +256,9 @@ int fscrypt_fname_disk_to_usr(struct inode *inode,
 {
 	const struct qstr qname = FSTR_TO_QSTR(iname);
 	struct fscrypt_digested_name digested_name;
+	struct fscrypt_nokey_name nokey_name;
+	size_t size;
+	int err;
 
 	if (fscrypt_is_dot_dotdot(&qname)) {
 		oname->name[0] = '.';
@@ -270,22 +273,39 @@ int fscrypt_fname_disk_to_usr(struct inode *inode,
 	if (inode->i_crypt_info)
 		return fname_decrypt(inode, iname, oname);
 
-	if (iname->len <= FSCRYPT_FNAME_MAX_UNDIGESTED_SIZE) {
-		oname->len = digest_encode(iname->name, iname->len,
-					   oname->name);
-		return 0;
+	/* --- START of merged logic for nokey name encoding --- */
+
+	/* Sanity check that struct fscrypt_nokey_name is tightly packed */
+	BUILD_BUG_ON(offsetofend(struct fscrypt_nokey_name, dirhash) !=
+		     offsetof(struct fscrypt_nokey_name, bytes));
+	BUILD_BUG_ON(offsetofend(struct fscrypt_nokey_name, bytes) !=
+		     offsetof(struct fscrypt_nokey_name, sha256));
+	BUILD_BUG_ON(BASE64_CHARS(FSCRYPT_NOKEY_NAME_MAX) > NAME_MAX);
+
+	nokey_name.dirhash[0] = hash;
+	nokey_name.dirhash[1] = minor_hash;
+
+	if (iname->len <= sizeof(nokey_name.bytes)) {
+		memcpy(nokey_name.bytes, iname->name, iname->len);
+		size = offsetof(struct fscrypt_nokey_name, bytes[iname->len]);
+	} else {
+		memcpy(nokey_name.bytes, iname->name, sizeof(nokey_name.bytes));
+		err = fscrypt_do_sha256(&iname->name[sizeof(nokey_name.bytes)],
+					iname->len - sizeof(nokey_name.bytes),
+					nokey_name.sha256);
+		if (err)
+			return err;
+		size = FSCRYPT_NOKEY_NAME_MAX;
 	}
-	digested_name.hash = hash;
-	digested_name.minor_hash = minor_hash;
-	memcpy(digested_name.digest,
-	       FSCRYPT_FNAME_DIGEST(iname->name, iname->len),
-	       FSCRYPT_FNAME_DIGEST_SIZE);
-	oname->name[0] = '_';
-	oname->len = 1 + digest_encode((const char *)&digested_name,
-				       sizeof(digested_name), oname->name + 1);
+
+	oname->len = base64_encode((const u8 *)&nokey_name, size, oname->name);
+
+	/* --- END of merged logic --- */
+
 	return 0;
 }
 EXPORT_SYMBOL(fscrypt_fname_disk_to_usr);
+
 
 /**
  * fscrypt_setup_filename() - prepare to search a possibly encrypted directory

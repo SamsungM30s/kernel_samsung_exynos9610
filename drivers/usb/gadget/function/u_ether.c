@@ -1160,163 +1160,166 @@ static struct device_type gadget_type = {
  *
  * Returns an eth_dev pointer on success, or an ERR_PTR on failure.
  */
-struct eth_dev *gether_setup_name(struct usb_gadget *g,
-		const char *dev_addr, const char *host_addr,
-		u8 ethaddr[ETH_ALEN], unsigned qmult, const char *netname)
+ struct eth_dev *gether_setup_name(struct usb_gadget *g,
+	const char *dev_addr, const char *host_addr,
+	u8 ethaddr[ETH_ALEN], unsigned qmult, const char *netname)
 {
-	struct eth_dev		*dev;
-	struct net_device	*net;
-	int			status;
+struct eth_dev		*dev;
+struct net_device	*net;
+int			status;
 
-	net = alloc_etherdev(sizeof *dev);
-	if (!net)
-		return ERR_PTR(-ENOMEM);
+net = alloc_etherdev(sizeof *dev);
+if (!net)
+	return ERR_PTR(-ENOMEM);
 
-	dev = netdev_priv(net);
-	spin_lock_init(&dev->lock);
-	spin_lock_init(&dev->req_lock);
-	INIT_WORK(&dev->work, eth_work);
-	INIT_WORK(&dev->rx_work, process_rx_w);
-	INIT_LIST_HEAD(&dev->tx_reqs);
-	INIT_LIST_HEAD(&dev->rx_reqs);
+dev = netdev_priv(net);
+spin_lock_init(&dev->lock);
+spin_lock_init(&dev->req_lock);
+INIT_WORK(&dev->work, eth_work);
+INIT_WORK(&dev->rx_work, process_rx_w);
+INIT_LIST_HEAD(&dev->tx_reqs);
+INIT_LIST_HEAD(&dev->rx_reqs);
+skb_queue_head_init(&dev->rx_frames);
 
-	skb_queue_head_init(&dev->rx_frames);
+/* network device setup */
+dev->net = net;
+dev->qmult = qmult;
+snprintf(net->name, sizeof(net->name), "%s%%d", netname);
 
-	/* network device setup */
-	dev->net = net;
-	dev->qmult = qmult;
-	snprintf(net->name, sizeof(net->name), "%s%%d", netname);
+if (get_ether_addr(dev_addr, net->dev_addr)) {
+	net->addr_assign_type = NET_ADDR_RANDOM;
+	dev_warn(&g->dev, "using random %s ethernet address\n", "self");
+} else {
+	net->addr_assign_type = NET_ADDR_SET;
+}
 
-	if (get_ether_addr(dev_addr, net->dev_addr))
-		dev_warn(&g->dev,
-			"using random %s ethernet address\n", "self");
 #ifdef CONFIG_USB_ANDROID_SAMSUNG_COMPOSITE
-	memcpy(dev->host_mac, ethaddr, ETH_ALEN);
-	printk(KERN_DEBUG "usb: set unique host mac\n");
+memcpy(dev->host_mac, ethaddr, ETH_ALEN);
+printk(KERN_DEBUG "usb: set unique host mac\n");
 #else
-	if (get_host_ether_addr(host_ethaddr, dev->host_mac))
-		dev_warn(&g->dev, "using random %s ethernet address\n", "host");
-	else
-		dev_warn(&g->dev, "using previous %s ethernet address\n", "host");
-
-	if (ethaddr)
-		memcpy(ethaddr, dev->host_mac, ETH_ALEN);
+if (get_ether_addr(host_addr, dev->host_mac))
+	dev_warn(&g->dev, "using random %s ethernet address\n", "host");
+else
+	dev_warn(&g->dev, "using previous %s ethernet address\n", "host");
 #endif
-	net->netdev_ops = &eth_netdev_ops;
 
-	net->ethtool_ops = &ops;
+if (ethaddr)
+	memcpy(ethaddr, dev->host_mac, ETH_ALEN);
 
-	/* MTU range: 14 - 15412 */
-	net->min_mtu = ETH_HLEN;
-	net->max_mtu = GETHER_MAX_MTU_SIZE;
+net->netdev_ops = &eth_netdev_ops;
+net->ethtool_ops = &ops;
 
-	dev->gadget = g;
-	SET_NETDEV_DEV(net, &g->dev);
-	SET_NETDEV_DEVTYPE(net, &gadget_type);
+/* MTU range: 14 - 15412 */
+net->min_mtu = ETH_HLEN;
+net->max_mtu = GETHER_MAX_MTU_SIZE;
 
-	status = register_netdev(net);
-	if (status < 0) {
-		dev_dbg(&g->dev, "register_netdev failed, %d\n", status);
-		free_netdev(net);
-		dev = ERR_PTR(status);
-	} else {
-		DBG(dev, "MAC %pM\n", net->dev_addr);
-		DBG(dev, "HOST MAC %pM\n", dev->host_mac);
+dev->gadget = g;
+SET_NETDEV_DEV(net, &g->dev);
+SET_NETDEV_DEVTYPE(net, &gadget_type);
 
-		/*
-		 * two kinds of host-initiated state changes:
-		 *  - iff DATA transfer is active, carrier is "on"
-		 *  - tx queueing enabled if open *and* carrier is "on"
-		 */
-		netif_carrier_off(net);
-	}
+status = register_netdev(net);
+if (status < 0) {
+	dev_dbg(&g->dev, "register_netdev failed, %d\n", status);
+	free_netdev(net);
+	dev = ERR_PTR(status);
+} else {
+	DBG(dev, "MAC %pM\n", net->dev_addr);
+	DBG(dev, "HOST MAC %pM\n", dev->host_mac);
+	netif_carrier_off(net);
+}
 
-	return dev;
+return dev;
 }
 EXPORT_SYMBOL_GPL(gether_setup_name);
 
 struct net_device *gether_setup_name_default(const char *netname)
 {
-	struct net_device	*net;
-	struct eth_dev		*dev;
+struct net_device	*net;
+struct eth_dev		*dev;
 
-	net = alloc_etherdev(sizeof(*dev));
-	if (!net)
-		return ERR_PTR(-ENOMEM);
+net = alloc_etherdev(sizeof(*dev));
+if (!net)
+	return ERR_PTR(-ENOMEM);
 
-	dev = netdev_priv(net);
-	spin_lock_init(&dev->lock);
-	spin_lock_init(&dev->req_lock);
-	INIT_WORK(&dev->work, eth_work);
-	INIT_WORK(&dev->rx_work, process_rx_w);
-	INIT_LIST_HEAD(&dev->tx_reqs);
-	INIT_LIST_HEAD(&dev->rx_reqs);
+dev = netdev_priv(net);
+spin_lock_init(&dev->lock);
+spin_lock_init(&dev->req_lock);
+INIT_WORK(&dev->work, eth_work);
+INIT_WORK(&dev->rx_work, process_rx_w);
+INIT_LIST_HEAD(&dev->tx_reqs);
+INIT_LIST_HEAD(&dev->rx_reqs);
+
 #ifdef CONFIG_USB_RNDIS_MULTIPACKET_WITH_TIMER
-	hrtimer_init(&dev->tx_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-	dev->tx_timer.function = tx_timeout;
+hrtimer_init(&dev->tx_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+dev->tx_timer.function = tx_timeout;
 #endif
-	skb_queue_head_init(&dev->rx_frames);
 
-	/* network device setup */
-	dev->net = net;
-	dev->qmult = QMULT_DEFAULT;
-	dev->tx_req_bufsize = 0;
-	snprintf(net->name, sizeof(net->name), "%s%%d", netname);
+skb_queue_head_init(&dev->rx_frames);
 
-	eth_random_addr(dev->dev_mac);
-	pr_warn("using random %s ethernet address\n", "self");
-	eth_random_addr(dev->host_mac);
-	pr_warn("using random %s ethernet address\n", "host");
+/* network device setup */
+dev->net = net;
+dev->qmult = QMULT_DEFAULT;
+dev->tx_req_bufsize = 0;
+snprintf(net->name, sizeof(net->name), "%s%%d", netname);
 
-	net->netdev_ops = &eth_netdev_ops;
+eth_random_addr(dev->dev_mac);
+pr_warn("using random %s ethernet address\n", "self");
+eth_random_addr(dev->host_mac);
+pr_warn("using random %s ethernet address\n", "host");
 
-	net->ethtool_ops = &ops;
-	SET_NETDEV_DEVTYPE(net, &gadget_type);
+net->addr_assign_type = NET_ADDR_RANDOM;
+net->netdev_ops = &eth_netdev_ops;
+net->ethtool_ops = &ops;
 
-	/* MTU range: 14 - 15412 */
-	net->min_mtu = ETH_HLEN;
-	net->max_mtu = GETHER_MAX_MTU_SIZE;
+SET_NETDEV_DEVTYPE(net, &gadget_type);
 
-	return net;
+/* MTU range: 14 - 15412 */
+net->min_mtu = ETH_HLEN;
+net->max_mtu = GETHER_MAX_MTU_SIZE;
+
+return net;
 }
 EXPORT_SYMBOL_GPL(gether_setup_name_default);
 
 int gether_register_netdev(struct net_device *net)
 {
-	struct eth_dev *dev;
-	struct usb_gadget *g;
-	struct sockaddr sa;
-	int status;
+struct eth_dev *dev;
+struct usb_gadget *g;
+int status;
+struct sockaddr sa;
 
-	if (!net->dev.parent)
-		return -EINVAL;
-	dev = netdev_priv(net);
-	g = dev->gadget;
-	status = register_netdev(net);
-	if (status < 0) {
-		dev_dbg(&g->dev, "register_netdev failed, %d\n", status);
-		return status;
-	} else {
-		DBG(dev, "HOST MAC %pM\n", dev->host_mac);
+if (!net->dev.parent)
+	return -EINVAL;
 
-		/* two kinds of host-initiated state changes:
-		 *  - iff DATA transfer is active, carrier is "on"
-		 *  - tx queueing enabled if open *and* carrier is "on"
-		 */
-		netif_carrier_off(net);
-	}
-	sa.sa_family = net->type;
-	memcpy(sa.sa_data, dev->dev_mac, ETH_ALEN);
-	rtnl_lock();
-	status = dev_set_mac_address(net, &sa);
-	rtnl_unlock();
-	if (status)
-		pr_warn("cannot set self ethernet address: %d\n", status);
-	else
-		DBG(dev, "MAC %pM\n", dev->dev_mac);
+dev = netdev_priv(net);
+g = dev->gadget;
 
+memcpy(net->dev_addr, dev->dev_mac, ETH_ALEN);
+
+status = register_netdev(net);
+if (status < 0) {
+	dev_dbg(&g->dev, "register_netdev failed, %d\n", status);
 	return status;
 }
+
+INFO(dev, "HOST MAC %pM\n", dev->host_mac);
+INFO(dev, "MAC %pM\n", dev->dev_mac);
+
+netif_carrier_off(net);
+
+sa.sa_family = net->type;
+memcpy(sa.sa_data, dev->dev_mac, ETH_ALEN);
+rtnl_lock();
+status = dev_set_mac_address(net, &sa);
+rtnl_unlock();
+if (status)
+	pr_warn("cannot set self ethernet address: %d\n", status);
+else
+	DBG(dev, "MAC %pM\n", dev->dev_mac);
+
+return status;
+}
+
 EXPORT_SYMBOL_GPL(gether_register_netdev);
 
 void gether_set_gadget(struct net_device *net, struct usb_gadget *g)
@@ -1338,6 +1341,7 @@ int gether_set_dev_addr(struct net_device *net, const char *dev_addr)
 	if (get_ether_addr(dev_addr, new_addr))
 		return -EINVAL;
 	memcpy(dev->dev_mac, new_addr, ETH_ALEN);
+	net->addr_assign_type = NET_ADDR_SET;
 	return 0;
 }
 EXPORT_SYMBOL_GPL(gether_set_dev_addr);

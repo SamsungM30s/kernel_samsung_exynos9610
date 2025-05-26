@@ -46,17 +46,29 @@ struct dma_buf_list {
 	struct list_head head;
 	struct mutex lock;
 };
-
 static struct dma_buf_list db_list;
 
-static int dma_buf_release(struct inode *inode, struct file *file)
+static char *dmabuffs_dname(struct dentry *dentry, char *buffer, int buflen)
+{
+	struct dma_buf *dmabuf;
+	char name[DMA_BUF_NAME_LEN];
+	size_t ret = 0;
+
+	dmabuf = dentry->d_fsdata;
+	mutex_lock(&dmabuf->lock);
+	if (dmabuf->name)
+		ret = strlcpy(name, dmabuf->name, DMA_BUF_NAME_LEN);
+	mutex_unlock(&dmabuf->lock);
+
+	return dynamic_dname(dentry, buffer, buflen, "/%s:%s",
+			     dentry->d_name.name, ret > 0 ? name : "");
+}
+
+static void dma_buf_release(struct dentry *dentry)
 {
 	struct dma_buf *dmabuf;
 
-	if (!is_dma_buf_file(file))
-		return -EINVAL;
-
-	dmabuf = file->private_data;
+	dmabuf = dentry->d_fsdata;
 
 	BUG_ON(dmabuf->vmapping_counter);
 
@@ -83,9 +95,45 @@ static int dma_buf_release(struct inode *inode, struct file *file)
 
 	module_put(dmabuf->owner);
 	kfree(dmabuf->exp_name);
+	kfree(dmabuf->name);
 	kfree(dmabuf);
+}
+
+static int dma_buf_file_release(struct inode *inode, struct file *file)
+{
+	struct dma_buf *dmabuf;
+
+	if (!is_dma_buf_file(file))
+		return -EINVAL;
+
+	dmabuf = file->private_data;
+
+	mutex_lock(&db_list.lock);
+	list_del(&dmabuf->list_node);
+	mutex_unlock(&db_list.lock);
+
 	return 0;
 }
+
+static const struct dentry_operations dma_buf_dentry_ops = {
+	.d_dname = dmabuffs_dname,
+	.d_release = dma_buf_release,
+};
+
+static struct vfsmount *dma_buf_mnt;
+
+static struct dentry *dma_buf_fs_mount(struct file_system_type *fs_type,
+		int flags, const char *name, void *data)
+{
+	return mount_pseudo(fs_type, "dmabuf:", NULL, &dma_buf_dentry_ops,
+			DMA_BUF_MAGIC);
+}
+
+static struct file_system_type dma_buf_fs_type = {
+	.name = "dmabuf",
+	.mount = dma_buf_fs_mount,
+	.kill_sb = kill_anon_super,
+};
 
 static int dma_buf_mmap_internal(struct file *file, struct vm_area_struct *vma)
 {
@@ -283,63 +331,74 @@ out:
 }
 
 static long dma_buf_ioctl(struct file *file,
-			  unsigned int cmd, unsigned long arg)
+	unsigned int cmd, unsigned long arg)
 {
-	struct dma_buf *dmabuf;
-	struct dma_buf_sync sync;
-	enum dma_data_direction direction;
-	int ret;
+struct dma_buf *dmabuf;
+struct dma_buf_sync sync;
+enum dma_data_direction direction;
+int ret;
 
-	dmabuf = file->private_data;
+dmabuf = file->private_data;
 
-	switch (cmd) {
-	case DMA_BUF_IOCTL_SYNC:
-		if (copy_from_user(&sync, (void __user *) arg, sizeof(sync)))
-			return -EFAULT;
+switch (cmd) {
+case DMA_BUF_IOCTL_SYNC:
+if (copy_from_user(&sync, (void __user *) arg, sizeof(sync)))
+  return -EFAULT;
 
-		if (sync.flags & ~DMA_BUF_SYNC_VALID_FLAGS_MASK)
-			return -EINVAL;
+if (sync.flags & ~DMA_BUF_SYNC_VALID_FLAGS_MASK)
+  return -EINVAL;
 
-		switch (sync.flags & DMA_BUF_SYNC_RW) {
-		case DMA_BUF_SYNC_READ:
-			direction = DMA_FROM_DEVICE;
-			break;
-		case DMA_BUF_SYNC_WRITE:
-			direction = DMA_TO_DEVICE;
-			break;
-		case DMA_BUF_SYNC_RW:
-			direction = DMA_BIDIRECTIONAL;
-			break;
-		default:
-			return -EINVAL;
-		}
-
-		if (sync.flags & DMA_BUF_SYNC_END)
-			ret = dma_buf_end_cpu_access(dmabuf, direction);
-		else
-			ret = dma_buf_begin_cpu_access(dmabuf, direction);
-
-		return ret;
-#ifdef CONFIG_COMPAT
-	case DMA_BUF_COMPAT_IOCTL_MERGE:
-#endif
-	case DMA_BUF_IOCTL_MERGE:
-		return dma_buf_merge_ioctl(dmabuf, cmd, arg);
-	case DMA_BUF_IOCTL_CONTAINER_SET_MASK:
-		return dmabuf_container_set_mask_user(dmabuf, arg);
-	case DMA_BUF_IOCTL_CONTAINER_GET_MASK:
-		return dmabuf_container_get_mask_user(dmabuf, arg);
-	case DMA_BUF_IOCTL_TRACK:
-		return dmabuf_trace_track_buffer(dmabuf);
-	case DMA_BUF_IOCTL_UNTRACK:
-		return dmabuf_trace_untrack_buffer(dmabuf);
-	default:
-		return -ENOTTY;
-	}
+switch (sync.flags & DMA_BUF_SYNC_RW) {
+case DMA_BUF_SYNC_READ:
+  direction = DMA_FROM_DEVICE;
+  break;
+case DMA_BUF_SYNC_WRITE:
+  direction = DMA_TO_DEVICE;
+  break;
+case DMA_BUF_SYNC_RW:
+  direction = DMA_BIDIRECTIONAL;
+  break;
+default:
+  return -EINVAL;
 }
 
+if (sync.flags & DMA_BUF_SYNC_END)
+  ret = dma_buf_end_cpu_access(dmabuf, direction);
+else
+  ret = dma_buf_begin_cpu_access(dmabuf, direction);
+
+return ret;
+
+#ifdef CONFIG_COMPAT
+case DMA_BUF_COMPAT_IOCTL_MERGE:
+#endif
+case DMA_BUF_IOCTL_MERGE:
+return dma_buf_merge_ioctl(dmabuf, cmd, arg);
+
+case DMA_BUF_IOCTL_CONTAINER_SET_MASK:
+return dmabuf_container_set_mask_user(dmabuf, arg);
+
+case DMA_BUF_IOCTL_CONTAINER_GET_MASK:
+return dmabuf_container_get_mask_user(dmabuf, arg);
+
+case DMA_BUF_IOCTL_TRACK:
+return dmabuf_trace_track_buffer(dmabuf);
+
+case DMA_BUF_IOCTL_UNTRACK:
+return dmabuf_trace_untrack_buffer(dmabuf);
+
+case DMA_BUF_SET_NAME_A:
+case DMA_BUF_SET_NAME_B:
+return dma_buf_set_name(dmabuf, (const char __user *)arg);
+
+default:
+return -ENOTTY;
+}
+}
+
+
 static const struct file_operations dma_buf_fops = {
-	.release	= dma_buf_release,
+	.release	= dma_buf_file_release,
 	.mmap		= dma_buf_mmap_internal,
 	.llseek		= dma_buf_llseek,
 	.poll		= dma_buf_poll,

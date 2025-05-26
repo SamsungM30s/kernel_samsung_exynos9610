@@ -820,6 +820,7 @@ static void dw_mci_exynos_set_sample(struct dw_mci *host, u32 sample, bool tunin
 	clksel = mci_readl(host, CLKSEL);
 	clksel = (clksel & ~0x7) | SDMMC_CLKSEL_CCLK_SAMPLE(sample);
 	mci_writel(host, CLKSEL, clksel);
+
 	if (sample == 6 || sample == 7)
 		sample_path_sel_en(host, AXI_BURST_LEN);
 	else
@@ -827,9 +828,11 @@ static void dw_mci_exynos_set_sample(struct dw_mci *host, u32 sample, bool tunin
 
 	if (priv->ctrl_flag & DW_MMC_EXYNOS_ENABLE_SHIFT)
 		dw_mci_exynos_set_enable_shift(host, sample, false);
+
 	if (!tuning)
 		dw_mci_set_quirk_endbit(host, clksel);
 }
+
 
 static void dw_mci_set_fine_tuning_bit(struct dw_mci *host, bool is_fine_tuning)
 {
@@ -1158,6 +1161,8 @@ static int dw_mci_exynos_execute_tuning(struct dw_mci_slot *slot, u32 opcode,
 		mci_writel(host, CDTHRCTL, 0 << 16 | 0);
 		dw_mci_exynos_set_sample(host, orig_sample, false);
 		ret = -EIO;
+		dev_warn(&mmc->class_dev,
+			"There is no candiates value about clksmpl!\n");
 	}
 
 	/* Rollback Clock drive strength */

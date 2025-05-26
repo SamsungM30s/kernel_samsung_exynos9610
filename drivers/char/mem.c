@@ -883,24 +883,24 @@ static const struct memdev {
 	fmode_t fmode;
 } devlist[] = {
 #ifdef CONFIG_DEVMEM
-	 [1] = { "mem", 0, &mem_fops, FMODE_UNSIGNED_OFFSET },
+	[1] = { "mem", 0, &mem_fops, FMODE_UNSIGNED_OFFSET },
 #endif
 #ifdef CONFIG_DEVKMEM
-	 [2] = { "kmem", 0, &kmem_fops, FMODE_UNSIGNED_OFFSET },
+	[2] = { "kmem", 0, &kmem_fops, FMODE_UNSIGNED_OFFSET },
 #endif
-	 [3] = { "null", 0666, &null_fops, 0 },
+	[3] = { "null", 0666, &null_fops, 0 },
 #ifdef CONFIG_DEVPORT
-	 [4] = { "port", 0, &port_fops, 0 },
+	[4] = { "port", 0, &port_fops, 0 },
 #endif
-	 [5] = { "zero", 0666, &zero_fops, 0 },
-	 [7] = { "full", 0666, &full_fops, 0 },
-	#ifdef CONFIG_SRANDOM
-	 [8] = { "random", 0666, &sfops, 0 },
-	 [9] = { "urandom", 0666, &sfops, 0 },
-	#else
-	 [8] = { "random", 0666, &random_fops, 0 },
-	 [9] = { "urandom", 0666, &urandom_fops, 0 },
-	#endif
+	[5] = { "zero", 0666, &zero_fops, 0 },
+	[7] = { "full", 0666, &full_fops, 0 },
+#ifdef CONFIG_SRANDOM
+	[8] = { "random", 0666, &sfops, FMODE_NOWAIT },
+	[9] = { "urandom", 0666, &sfops, FMODE_NOWAIT },
+#else
+	[8] = { "random", 0666, &random_fops, FMODE_NOWAIT },
+	[9] = { "urandom", 0666, &urandom_fops, FMODE_NOWAIT },
+#endif
 #ifdef CONFIG_PRINTK
 	[11] = { "kmsg", 0644, &kmsg_fops, 0 },
 #endif
@@ -908,6 +908,7 @@ static const struct memdev {
 	[12] = { "mst_ctrl", 0666, &mst_ctrl_fops, 0 },
 #endif
 };
+
 
 static int memory_open(struct inode *inode, struct file *filp)
 {

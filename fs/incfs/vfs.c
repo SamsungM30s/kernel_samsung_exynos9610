@@ -371,38 +371,48 @@ static int incfs_init_dentry(struct dentry *dentry, struct path *path)
 }
 
 static struct dentry *open_or_create_special_dir(struct dentry *backing_dir,
-						 const char *name)
+						 const char *name,
+						 bool *created)
 {
 	struct dentry *index_dentry;
-	struct inode *backing_inode = d_inode(backing_dir);
+	struct inode *backing_inode;
 	int err = 0;
 
+	if (!backing_dir)
+		return ERR_PTR(-EFAULT);
+
+	backing_inode = d_inode(backing_dir);
+
 	index_dentry = incfs_lookup_dentry(backing_dir, name);
-	if (!index_dentry) {
+	if (!index_dentry)
 		return ERR_PTR(-EINVAL);
-	} else if (IS_ERR(index_dentry)) {
+	else if (IS_ERR(index_dentry))
 		return index_dentry;
-	} else if (d_really_is_positive(index_dentry)) {
-		/* Index already exists. */
+	else if (d_really_is_positive(index_dentry)) {
+		/* Directory already exists. */
+		*created = false;
 		return index_dentry;
 	}
 
-	/* Index needs to be created. */
+	/* Directory needs to be created. */
 	inode_lock_nested(backing_inode, I_MUTEX_PARENT);
 	err = vfs_mkdir(backing_inode, index_dentry, 0777);
 	inode_unlock(backing_inode);
 
-	if (err)
+	if (err) {
+		dput(index_dentry);
 		return ERR_PTR(err);
+	}
 
-	if (!d_really_is_positive(index_dentry) ||
-		unlikely(d_unhashed(index_dentry))) {
+	if (!d_really_is_positive(index_dentry) || unlikely(d_unhashed(index_dentry))) {
 		dput(index_dentry);
 		return ERR_PTR(-EINVAL);
 	}
 
+	*created = true;
 	return index_dentry;
 }
+
 
 static int read_single_page_timeouts(struct data_file *df, struct file *f,
 				     int block_index, struct mem_range range,
@@ -516,7 +526,138 @@ int incfs_link(struct dentry *what, struct dentry *where)
 	return error;
 }
 
-int incfs_unlink(struct dentry *dentry)
+static char *file_id_to_str(incfs_uuid_t id)
+{
+	char *result = kmalloc(1 + sizeof(id.bytes) * 2, GFP_NOFS);
+	char *end;
+
+	if (!result)
+		return NULL;
+
+	end = bin2hex(result, id.bytes, sizeof(id.bytes));
+	*end = 0;
+	return result;
+}
+
+static struct mem_range incfs_copy_signature_info_from_user(u8 __user *original,
+							    u64 size)
+{
+	u8 *result;
+
+	if (!original)
+		return range(NULL, 0);
+
+	if (size > INCFS_MAX_SIGNATURE_SIZE)
+		return range(ERR_PTR(-EFAULT), 0);
+
+	result = kzalloc(size, GFP_NOFS | __GFP_COMP);
+	if (!result)
+		return range(ERR_PTR(-ENOMEM), 0);
+
+	if (copy_from_user(result, original, size)) {
+		kfree(result);
+		return range(ERR_PTR(-EFAULT), 0);
+	}
+
+	return range(result, size);
+}
+
+static int init_new_file(struct mount_info *mi, struct dentry *dentry,
+			 incfs_uuid_t *uuid, u64 size, struct mem_range attr,
+			 u8 __user *user_signature_info, u64 signature_size)
+{
+	struct path path = {};
+	struct file *new_file;
+	int error = 0;
+	struct backing_file_context *bfc = NULL;
+	u32 block_count;
+	struct mem_range raw_signature = { NULL };
+	struct mtree *hash_tree = NULL;
+
+	if (!mi || !dentry || !uuid)
+		return -EFAULT;
+
+	/* Resize newly created file to its true size. */
+	path = (struct path) {
+		.mnt = mi->mi_backing_dir_path.mnt,
+		.dentry = dentry
+	};
+	new_file = dentry_open(&path, O_RDWR | O_NOATIME | O_LARGEFILE,
+			       current_cred());
+
+	if (IS_ERR(new_file)) {
+		error = PTR_ERR(new_file);
+		goto out;
+	}
+
+	bfc = incfs_alloc_bfc(mi, new_file);
+	fput(new_file);
+	if (IS_ERR(bfc)) {
+		error = PTR_ERR(bfc);
+		bfc = NULL;
+		goto out;
+	}
+
+	mutex_lock(&bfc->bc_mutex);
+	error = incfs_write_fh_to_backing_file(bfc, uuid, size);
+	if (error)
+		goto out;
+
+	if (attr.data && attr.len) {
+		error = incfs_write_file_attr_to_backing_file(bfc,
+							attr, NULL);
+		if (error)
+			goto out;
+	}
+
+	block_count = (u32)get_blocks_count_for_size(size);
+
+	if (user_signature_info) {
+		raw_signature = incfs_copy_signature_info_from_user(
+			user_signature_info, signature_size);
+
+		if (IS_ERR(raw_signature.data)) {
+			error = PTR_ERR(raw_signature.data);
+			raw_signature.data = NULL;
+			goto out;
+		}
+
+		hash_tree = incfs_alloc_mtree(raw_signature, block_count);
+		if (IS_ERR(hash_tree)) {
+			error = PTR_ERR(hash_tree);
+			hash_tree = NULL;
+			goto out;
+		}
+
+		error = incfs_write_signature_to_backing_file(
+			bfc, raw_signature, hash_tree->hash_tree_area_size);
+		if (error)
+			goto out;
+
+		block_count += get_blocks_count_for_size(
+			hash_tree->hash_tree_area_size);
+	}
+
+	if (block_count)
+		error = incfs_write_blockmap_to_backing_file(bfc, block_count);
+
+	if (error)
+		goto out;
+out:
+	if (bfc) {
+		mutex_unlock(&bfc->bc_mutex);
+		incfs_free_bfc(bfc);
+	}
+	incfs_free_mtree(hash_tree);
+	kfree(raw_signature.data);
+
+	if (error)
+		pr_debug("incfs: %s error: %d\n", __func__, error);
+	return error;
+}
+
+
+static int incfs_link(struct dentry *what, struct dentry *where)
 {
 	struct dentry *parent_dentry = dget_parent(dentry);
 	struct inode *pinode = d_inode(parent_dentry);
@@ -556,6 +697,7 @@ static void maybe_delete_incomplete_file(struct data_file *df)
 	file_id_str = file_id_to_str(df->df_id);
 	if (!file_id_str)
 		return;
+	dir_f = dentry_open(base_path, O_RDONLY | O_NOATIME, current_cred());
 
 	incomplete_file_dentry = incfs_lookup_dentry(
 					df->df_mount_info->mi_incomplete_dir,
@@ -1225,6 +1367,7 @@ static int file_open(struct inode *inode, struct file *file)
 	struct mount_info *mi = get_mount_info(inode->i_sb);
 	struct file *backing_file = NULL;
 	struct path backing_path = {};
+	const struct cred *old_cred;
 	int err = 0;
 	int flags = O_NOATIME | O_LARGEFILE |
 		(S_ISDIR(inode->i_mode) ? O_RDONLY : O_RDWR);
@@ -1238,7 +1381,10 @@ static int file_open(struct inode *inode, struct file *file)
 	if (!backing_path.dentry)
 		return -EBADF;
 
-	backing_file = dentry_open(&backing_path, flags, mi->mi_owner);
+	/* Temporarily elevate privileges to open backing file */
+	old_cred = override_creds(mi->mi_owner);
+	backing_file = dentry_open(&backing_path, flags, current_cred());
+	revert_creds(old_cred);
 	path_put(&backing_path);
 
 	if (IS_ERR(backing_file)) {
@@ -1263,20 +1409,20 @@ static int file_open(struct inode *inode, struct file *file)
 		err = make_inode_ready_for_data_ops(mi, inode, backing_file);
 
 	} else if (S_ISDIR(inode->i_mode)) {
-		struct dir_file *dir = NULL;
-
-		dir = incfs_open_dir_file(mi, backing_file);
+		struct dir_file *dir = incfs_open_dir_file(mi, backing_file);
 		if (IS_ERR(dir))
 			err = PTR_ERR(dir);
 		else
 			file->private_data = dir;
-	} else
+	} else {
 		err = -EBADF;
+	}
 
 out:
 	if (err) {
 		pr_debug("name:%s err: %d\n",
 			 file->f_path.dentry->d_name.name, err);
+
 		if (S_ISREG(inode->i_mode))
 			kfree(file->private_data);
 		else if (S_ISDIR(inode->i_mode))
@@ -1287,6 +1433,7 @@ out:
 
 	if (backing_file)
 		fput(backing_file);
+
 	return err;
 }
 
@@ -1522,6 +1669,7 @@ struct dentry *incfs_mount_fs(struct file_system_type *type, int flags,
 	struct dentry *incomplete_dir = NULL;
 	struct super_block *src_fs_sb = NULL;
 	struct inode *root_inode = NULL;
+	bool index_created = false;
 	struct super_block *sb = sget(type, NULL, set_anon_super, flags, NULL);
 	int error = 0;
 
@@ -1539,87 +1687,93 @@ struct dentry *incfs_mount_fs(struct file_system_type *type, int flags,
 
 	BUILD_BUG_ON(PAGE_SIZE != INCFS_DATA_FILE_BLOCK_SIZE);
 
-	error = parse_options(&options, (char *)data);
-	if (error != 0) {
-		pr_err("incfs: Options parsing error. %d\n", error);
-		goto err;
-	}
-
-	sb->s_bdi->ra_pages = options.readahead_pages;
 	if (!dev_name) {
 		pr_err("incfs: Backing dir is not set, filesystem can't be mounted.\n");
 		error = -ENOENT;
-		goto err;
+		goto err_deactivate;
 	}
+
+	error = parse_options(&options, (char *)data);
+	if (error != 0) {
+		pr_err("incfs: Options parsing error. %d\n", error);
+		goto err_deactivate;
+	}
+
+	sb->s_bdi->ra_pages = options.readahead_pages;
 
 	error = kern_path(dev_name, LOOKUP_FOLLOW | LOOKUP_DIRECTORY,
-			&backing_dir_path);
+			  &backing_dir_path);
 	if (error || backing_dir_path.dentry == NULL ||
-		!d_really_is_positive(backing_dir_path.dentry)) {
-		pr_err("incfs: Error accessing: %s.\n",
-			dev_name);
-		goto err;
+	    !d_really_is_positive(backing_dir_path.dentry)) {
+		pr_err("incfs: Error accessing: %s.\n", dev_name);
+		goto err_deactivate;
 	}
+
 	src_fs_sb = backing_dir_path.dentry->d_sb;
 	sb->s_maxbytes = src_fs_sb->s_maxbytes;
+	sb->s_stack_depth = src_fs_sb->s_stack_depth + 1;
+
+	if (sb->s_stack_depth > FILESYSTEM_MAX_STACK_DEPTH) {
+		error = -EINVAL;
+		goto err_put_path;
+	}
 
 	mi = incfs_alloc_mount_info(sb, &options, &backing_dir_path);
-
 	if (IS_ERR_OR_NULL(mi)) {
 		error = PTR_ERR(mi);
 		pr_err("incfs: Error allocating mount info. %d\n", error);
-		mi = NULL;
-		goto err;
+		goto err_put_path;
 	}
 
-	index_dir = open_or_create_special_dir(backing_dir_path.dentry,
-					       index_name);
+	sb->s_fs_info = mi;
+	mi->mi_backing_dir_path = backing_dir_path;
+
+	/* Open or create .index directory */
+	index_dir = open_or_create_index_dir(backing_dir_path.dentry, &index_created);
 	if (IS_ERR_OR_NULL(index_dir)) {
 		error = PTR_ERR(index_dir);
-		pr_err("incfs: Can't find or create .index dir in %s\n",
-			dev_name);
-		/* No need to null index_dir since we don't put it */
-		goto err;
+		pr_err("incfs: Can't find or create .index dir in %s\n", dev_name);
+		goto err_put_path;
 	}
 	mi->mi_index_dir = index_dir;
+	mi->mi_index_free = index_created;
 
-	incomplete_dir = open_or_create_special_dir(backing_dir_path.dentry,
-						    incomplete_name);
+	/* Open or create .incomplete directory */
+	incomplete_dir = open_or_create_special_dir(backing_dir_path.dentry, incomplete_name);
 	if (IS_ERR_OR_NULL(incomplete_dir)) {
 		error = PTR_ERR(incomplete_dir);
-		pr_err("incfs: Can't find or create .incomplete dir in %s\n",
-			dev_name);
-		/* No need to null incomplete_dir since we don't put it */
-		goto err;
+		pr_err("incfs: Can't find or create .incomplete dir in %s\n", dev_name);
+		goto err_put_path;
 	}
 	mi->mi_incomplete_dir = incomplete_dir;
 
-	sb->s_fs_info = mi;
 	root_inode = fetch_regular_inode(sb, backing_dir_path.dentry);
 	if (IS_ERR(root_inode)) {
 		error = PTR_ERR(root_inode);
-		goto err;
+		goto err_put_path;
 	}
 
 	sb->s_root = d_make_root(root_inode);
 	if (!sb->s_root) {
 		error = -ENOMEM;
-		goto err;
+		goto err_put_path;
 	}
+
 	error = incfs_init_dentry(sb->s_root, &backing_dir_path);
 	if (error)
-		goto err;
+		goto err_put_path;
 
 	path_put(&backing_dir_path);
 	sb->s_flags |= SB_ACTIVE;
 
 	pr_debug("incfs: mount\n");
 	return dget(sb->s_root);
-err:
-	sb->s_fs_info = NULL;
+
+err_put_path:
 	path_put(&backing_dir_path);
-	incfs_free_mount_info(mi);
+err_deactivate:
 	deactivate_locked_super(sb);
+	pr_err("incfs: mount failed %d\n", error);
 	return ERR_PTR(error);
 }
 
@@ -1650,10 +1804,28 @@ static int incfs_remount_fs(struct super_block *sb, int *flags, char *data)
 void incfs_kill_sb(struct super_block *sb)
 {
 	struct mount_info *mi = sb->s_fs_info;
+	struct inode *dinode = NULL;
 
 	pr_debug("incfs: unmount\n");
-	incfs_free_mount_info(mi);
-	generic_shutdown_super(sb);
+
+	/*
+	 * We must kill the super before freeing mi, since killing the super
+	 * triggers inode eviction, which triggers the final update of the
+	 * backing file, which uses certain information for mi
+	 */
+	kill_anon_super(sb);
+
+	if (mi) {
+		if (mi->mi_backing_dir_path.dentry)
+			dinode = d_inode(mi->mi_backing_dir_path.dentry);
+
+		if (dinode) {
+			if (mi->mi_index_dir && mi->mi_index_free)
+				vfs_rmdir(dinode, mi->mi_index_dir);
+		}
+		incfs_free_mount_info(mi);
+		sb->s_fs_info = NULL;
+	}
 }
 
 static int show_options(struct seq_file *m, struct dentry *root)

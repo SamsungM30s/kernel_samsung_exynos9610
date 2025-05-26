@@ -267,3 +267,4 @@ obj-$(CONFIG_KAIR) += kair.o
 
 obj-$(CONFIG_DEBUG_SNAPSHOT) += debug-snapshot.o debug-snapshot-log.o debug-snapshot-utils.o \
 				debug-snapshot-pstore.o debug-snapshot-sysfs.o debug-snapshot-helper.o
+obj-y += crypto/
