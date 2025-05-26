@@ -2,9 +2,9 @@ name: Build Staging (Stable) Build
 
 on:
   push:
-    branches: [ ack ]
+    branches: [ main ]
   pull_request:
-    branches: [ ack ]
+    branches: [ main ]
 
 jobs:
   m30s:
