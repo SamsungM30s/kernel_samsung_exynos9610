@@ -5,9 +5,7 @@
 #### Common Fresh Core Source for the Exynos 9610 Platform
 
 Supports the following devices:
-
-- Samsung Galaxy A50 (`a50`)
-- Samsung Galaxy A50s (`a50s`)
+- Samsung Galaxy M30s
 
 Looking for the Linux kernel readme? [Click here.](https://github.com/TenSeventy7/android_kernel_samsung_exynos9610_fresh/blob/staging/README_Kernel)
 
